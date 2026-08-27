@@ -263,8 +263,20 @@ page cache — all were flat/controlled. It is inherent and cannot be removed by
 draft slots accepted on the best runs. The model would benefit from a larger draft budget and QSA
 makes that impossible.
 
+**Large-sample figure.** After a full evaluation campaign — **211,743 verify calls** across
+backend, SQL, debugging, frontend and multi-file tasks — the engine reports:
+
+```
+sglang:spec_accept_length  3.425      sglang:spec_accept_rate  0.808
+```
+
+**~81% of draft slots accepted over 211k verifications**, on a mixed real workload rather than a
+single prompt. That is the number to quote; the n=16 figures above show the per-run spread and the
+correlation with throughput.
+
 **External anchor.** The LMSYS day-0 writeup reports this model on **B200 TP4 NVFP4 at 540 tok/s
-bs1 with MTP, accept length 3.3**. Our median is **3.500** on two GB10s — *higher* than the
+bs1 with MTP, accept length 3.3**. Our campaign figure is **3.425** and the single-prompt median
+**3.500** on two GB10s — *higher* than the
 reference implementation's published figure on far larger hardware. That's an independent
 cross-check of both the number and the method, which matters because acceptance is easy to
 measure wrongly (we did, three times, before getting it right).
