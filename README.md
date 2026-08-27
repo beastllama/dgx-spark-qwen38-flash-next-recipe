@@ -63,9 +63,11 @@ as a headline. Real generation of a complete HTML page runs at **~63 tok/s**; th
 `ignore_eos` on a hard prompt reports **47.6**. Both are correct. Quote the one that matches what
 you're doing, and say which.
 
-**Speculative decoding is doing the heavy lifting.** The same stack without MTP measured ~20–21
-tok/s. Turning it on is worth roughly **3×** — see §3 for why 3/1/4 is the ceiling and how close the
-drafter gets to it.
+**Speculative decoding is doing much of the work, but the delta is not isolated.** Our earlier
+vLLM deployment of the same checkpoint (no MTP, `--enforce-eager`) decoded at 20–21 tok/s; this
+SGLang stack with MTP runs ~3× that. **Engine, CUDA-graph mode and MTP all changed together** — we
+have no SGLang-with-MTP-off measurement, and neither published recipe ships one to compare against.
+See §3 for why 3/1/4 is the ceiling.
 
 ---
 
@@ -263,23 +265,36 @@ page cache — all were flat/controlled. It is inherent and cannot be removed by
 draft slots accepted on the best runs. The model would benefit from a larger draft budget and QSA
 makes that impossible.
 
-**Large-sample figure.** After a full evaluation campaign — **211,743 verify calls** across
-backend, SQL, debugging, frontend and multi-file tasks — the engine reports:
+**Cumulative figure — and the trap we fell into publishing it.** Over the eval campaign:
+**accept length 2.99, accept rate 0.66**, derived from lifetime counters only:
 
 ```
-sglang:spec_accept_length  3.425      sglang:spec_accept_rate  0.808
+generation_tokens_total  601,124 + 49,010 = 650,134   (BOTH streaming series, summed by name)
+spec_verify_calls_total                     217,242
+                          650,134 / 217,242 = 2.99
 ```
 
-**~81% of draft slots accepted over 211k verifications**, on a mixed real workload rather than a
-single prompt. That is the number to quote; the n=16 figures above show the per-run spread and the
-correlation with throughput.
+⚠️ **The windowed-gauge trap — we published this mistake before catching it.** SGLang's
+`/metrics` gauges `sglang:spec_accept_length` and `spec_accept_rate` are **recomputed and reset
+every decode-log interval**. They describe the last few dozen forwards, not the lifetime.
+`spec_verify_calls_total` *is* lifetime. Pairing them silently labels a window as a campaign.
 
-**External anchor.** The LMSYS day-0 writeup reports this model on **B200 TP4 NVFP4 at 540 tok/s
-bs1 with MTP, accept length 3.3**. Our campaign figure is **3.425** and the single-prompt median
-**3.500** on two GB10s — *higher* than the
-reference implementation's published figure on far larger hardware. That's an independent
-cross-check of both the number and the method, which matters because acceptance is easy to
-measure wrongly (we did, three times, before getting it right).
+Watch a single gauge over minutes on an idle-ish engine:
+
+```
+spec_accept_length:  1.45  →  3.425  →  2.05  →  3.325     (window)
+spec_verify_calls_total: 211,743  →  217,091  →  217,242   (lifetime, monotonic)
+```
+
+A cumulative average over *more* calls cannot fall from 3.425 to 2.05. **We published
+"3.425 over 211,743 verify calls" — a gauge read pinned to a counter — and it flattered us by
+~15%.** The per-run figures above survive, because a per-run gauge read approximates that run's
+own window. Any dashboard reading of these gauges is a window too.
+
+**External anchor.** LMSYS reports this model on B200 TP4 NVFP4 at **accept length 3.3** (their
+workload is unstated). Our numbers **bracket** it — 2.99 cumulative on a mixed workload, 3.50
+median on a hard code prompt. Given the ±40 pp prompt sensitivity below, "the same range" is the
+most anyone can honestly claim from a cross-workload acceptance comparison.
 
 LMSYS also names the mechanism behind the ceiling: **IndexShare MTP** reuses QSA selections across
 draft steps, which is precisely why the pending index-key ring holds a single group.
@@ -378,22 +393,47 @@ temp 1.0 and saw none, on the *riskier* configuration (flashinfer sampling, radi
 
 ## Capability evaluation
 
-13 tasks with **executable verification** — code is graded by running it, not by inspecting it —
-across backend Python, backend Node/TS, SQL schema design, debugging, three frontend stacks
-(vanilla, React, Next.js App Router), Sanity CMS schemas, and a multi-file cross-file debugging
-task. Two passes per arm, temp 0, held-out tests the model never saw.
+13 tasks across backend Python, backend Node/TS, SQL schema design, debugging, three frontend
+stacks (vanilla, React, Next.js App Router), Sanity CMS schemas, and multi-file cross-file
+debugging. Two passes per arm, temp 0.
 
-| arm | scored PASS | wall clock, 13 tasks |
-|---|---|---|
-| thinking **OFF** | **13 / 13** | **~4 min** |
-| thinking **ON** | 11 / 11 (+1 INVALID) | **22–31 min** |
+**8 of the 13 are graded by executing held-out tests in a sandbox** (backend Python ×2, Node ×2,
+SQL, debugging ×2, and the cross-file task). The three frontend tasks, the Sanity schema and one
+large-codebase task are graded by **structural checks on the output text** — weaker, and the
+negative controls validate only the executing verifiers.
 
-**Thinking off is ~7× faster with equal correctness on real coding work.** Combined with the 30%
-runaway rate and the budget-crowding in §5, that is three independent lines of evidence pointing
-the same way: **thinking off for code generation.**
+| arm | scored PASS | INVALID | wall clock¹ |
+|---|---|---|---|
+| thinking **OFF**, pass 1 | **13 / 13** | 0 | **3 m 44 s** |
+| thinking **OFF**, pass 2 | **13 / 13** | 0 | **3 m 45 s** |
+| thinking **ON**, pass 1 | 12 / 12 | 1 | **81 min** |
+| thinking **ON**, pass 2 | 11 / 11 | 2 | **84 min** |
+
+<sub>¹ Wall clock between arm-start markers in the run log — this is what you actually wait for.
+It is much larger than the sum of per-task `elapsed`, because retried attempts are not counted in
+the per-record figure and one frontend task alone burned ~3 × 400 s per thinking-ON arm.</sub>
+
+**Thinking off is ~22× faster in wall clock, with equal correctness.** Both INVALIDs in pass 2
+were thinking-budget exhaustion at 20,000 tokens on long-output tasks.
+
+**A fourth independent measurement of the runaway, from the campaign itself:** retries fired in
+**10 of 30 thinking-ON cells and 0 of 32 thinking-OFF cells**. The thinking-ON scoreline is
+therefore *retry-dependent* — retries only fire on INVALID (truncation or empty output), never on
+FAIL, so they cannot turn a wrong answer into a pass, but they do resample a nondeterministic
+coin-flip. Without the retry policy the thinking arm would show ~30% failures that are not
+capability failures.
+
+⚠️ **A clean sweep measures the suite, not the model.** 13/13 bounds the failure rate; it does not
+locate the ceiling. The 95% Wilson interval on 13/13 is roughly **77–100%** — wide, because n is
+small. The honest reading is "this suite sits below the model's capability", not "this model does
+not fail". These tasks were written by us and are not a public benchmark.
+
+**Disclosure:** first-pass results under two buggy verifiers were 12/13. `fe-01` (both OFF passes)
+and `dbg-02` (ON pass 1) were **re-run after the verifier fixes described below** — fresh
+generations, not re-grades. The headline includes those re-run cells.
 
 The hardest task — a four-file service with a cross-file contract bug (a heap negating priority
-while the constants documented the opposite convention) — passed in **24 s**, changing only the
+while the constants documented the opposite convention) — passed in **18 s** with thinking on (under 4 s with it off), changing only the
 file that needed changing, fixing the misleading comment that caused it, and satisfying a held-out
 three-part test covering ordering, FIFO tie-break, and untouched retry semantics.
 
