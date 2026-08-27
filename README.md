@@ -230,9 +230,27 @@ page cache — all were flat/controlled. It is inherent and cannot be removed by
 draft slots accepted on the best runs. The model would benefit from a larger draft budget and QSA
 makes that impossible.
 
+**External anchor.** The LMSYS day-0 writeup reports this model on **B200 TP4 NVFP4 at 540 tok/s
+bs1 with MTP, accept length 3.3**. Our median is **3.500** on two GB10s — *higher* than the
+reference implementation's published figure on far larger hardware. That's an independent
+cross-check of both the number and the method, which matters because acceptance is easy to
+measure wrongly (we did, three times, before getting it right).
+
+LMSYS also names the mechanism behind the ceiling: **IndexShare MTP** reuses QSA selections across
+draft steps, which is precisely why the pending index-key ring holds a single group.
+
 ⚠️ **Acceptance swings ~40 pp on prompt alone.** Measured on the same engine within one hour:
 `3.5–3.7` on one code prompt, `2.475` on a chat+code mix. All arithmetically self-consistent — they
 measure different prompt mixes. **Never quote an acceptance number without naming the prompt set.**
+
+**Is there a way past the ceiling?** Not today. As of 2026-08-27 no DFlash / DSpark / EAGLE3
+drafter exists for Flash-Next — z-lab's DFlash repo lists Muse-Glimmer-30B and Qwen3.8-**27B**
+(a different model) and does not mention Flash-Next in supported models, roadmap or TODO. Two
+things look like hits and are not: a HuggingFace repo named `…-MTP-Drafter-GGUF` is a repackaging
+of the built-in MTP ("extracted … unmodified", 33 tensors), and SGLang's cookbook lists
+`--speculative-algorithm DFLASH` because that's the engine-wide picker on every page — it needs a
+`--speculative-draft-model-path` checkpoint that doesn't exist for this target. **The flag being
+selectable is a label; the weights are the evidence.**
 
 ### 4. Vision works, and the self-review loop closes
 
