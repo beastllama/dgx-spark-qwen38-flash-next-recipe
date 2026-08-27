@@ -364,6 +364,53 @@ temp 1.0 and saw none, on the *riskier* configuration (flashinfer sampling, radi
 
 ---
 
+## Capability evaluation
+
+13 tasks with **executable verification** — code is graded by running it, not by inspecting it —
+across backend Python, backend Node/TS, SQL schema design, debugging, three frontend stacks
+(vanilla, React, Next.js App Router), Sanity CMS schemas, and a multi-file cross-file debugging
+task. Two passes per arm, temp 0, held-out tests the model never saw.
+
+| arm | scored PASS | wall clock, 13 tasks |
+|---|---|---|
+| thinking **OFF** | **13 / 13** | **~4 min** |
+| thinking **ON** | 11 / 11 (+1 INVALID) | **22–31 min** |
+
+**Thinking off is ~7× faster with equal correctness on real coding work.** Combined with the 30%
+runaway rate and the budget-crowding in §5, that is three independent lines of evidence pointing
+the same way: **thinking off for code generation.**
+
+The hardest task — a four-file service with a cross-file contract bug (a heap negating priority
+while the constants documented the opposite convention) — passed in **24 s**, changing only the
+file that needed changing, fixing the misleading comment that caused it, and satisfying a held-out
+three-part test covering ordering, FIFO tie-break, and untouched retry semantics.
+
+### Verifier validation
+
+Every run includes negative controls whose tests are **deliberately unsatisfiable**: a Python task
+asserting `2+2==5`, and a SQL task whose table is pre-created so the model's own DDL must collide.
+Both failed correctly in all four arms, and real tasks pass — so the verifiers genuinely execute
+and are not merely always-fail.
+
+### ⚠️ Three of our own checks failed *correct* output
+
+This is the part worth copying if you build something similar. In the first pass, three verifiers
+produced confident, specific, **false** results:
+
+| check | what it did | reality |
+|---|---|---|
+| mutable-default fix | asserted the caller's list must not be mutated | the prompt never asked for a defensive copy; taking ownership is a normal contract |
+| self-contained HTML | banned the substring `http://` | flagged `xmlns="http://www.w3.org/2000/svg"` — a namespace URI browsers never fetch |
+| token budget | 6,000 max_tokens | thinking consumed it, so truncation looked like failure |
+
+Uncorrected, the writeup would have claimed this model fails the classic mutable-default bug and
+cannot produce self-contained HTML. Both are the opposite of true. **A verifier is a claim about
+the world and needs its own negative controls** — ours caught the model's failures fine; what they
+could not catch was themselves. The tell each time was a *surprising* failure that turned out, on
+reading the actual output, to be correct.
+
+---
+
 ## Dead ends — documented so you don't spend the time
 
 **Clock headroom does not exist.** `clocks.max.sm` reports 3003 MHz; the GPU runs 2528 under load.
