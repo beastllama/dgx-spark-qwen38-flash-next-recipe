@@ -36,6 +36,39 @@ comparable to anything — including these.</sub>
 
 ---
 
+## Performance
+
+Two DGX Sparks. 180B params (125B backbone + 51B PLE), NVFP4, 262k context, vision on.
+
+| | tok/s | conditions |
+|---|---|---|
+| **Single stream, real work** | **~63** | 10.7k-token HTML page, natural stop, 2522 MHz |
+| Single stream, 400 tok | 63.7 | code prompt, `ignore_eos` |
+| 2 concurrent | **104.9** agg | 52.8/stream |
+| 4 concurrent | **178.7** agg | 45.2/stream |
+| **6 concurrent** | **306.6** agg | 51.7/stream — still climbing |
+| Prefill | **3,050** | ~7,450-token unique prompt, `cached_tokens=0` asserted, n=6 |
+| Stress floor | 47.6 | `ignore_eos` + hard prompt + 800 tok — a deliberate FLOOR, see below |
+
+**Power and heat, at concurrency 4:** **52 °C, 35.5 W** peak per node; 42 °C / 10.4 W idle. That is
+roughly **half the draw** of a comparably-sized dense-ish MoE we previously ran on the same boxes
+(88 °C / 65 W), at *higher* clocks. Cause: ~6B active params per token (10 of 512 experts) and only
+12 of 48 layers are full attention — the rest are linear-attention GDN, so decode waits on memory
+rather than burning watts. Practical effect: thermal guard stages sized for the older model are
+unreachable by 43 °C, and two Sparks serve this at **~71 W combined under load**.
+
+**Why two numbers for "single stream".** `ignore_eos` benchmarks force generation past the model's
+natural stopping point into degenerate text. They're excellent for regression detection and useless
+as a headline. Real generation of a complete HTML page runs at **~63 tok/s**; the same stack under
+`ignore_eos` on a hard prompt reports **47.6**. Both are correct. Quote the one that matches what
+you're doing, and say which.
+
+**Speculative decoding is doing the heavy lifting.** The same stack without MTP measured ~20–21
+tok/s. Turning it on is worth roughly **3×** — see §3 for why 3/1/4 is the ceiling and how close the
+drafter gets to it.
+
+---
+
 ## Recipe
 
 **1. Base stack.** Clone [MiaAI-Lab's repo](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks)
