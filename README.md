@@ -4,8 +4,9 @@ Serving **Qwen3.8-Flash-Next-NVFP4** across **two DGX Sparks (GB10 / sm_121)** w
 over ConnectX-7 RoCE (**single rail** — dual-rail is measured fabric capability, untested
 under SGLang). Vision enabled. 262,144 context. MTP speculative decoding.
 
-This is **not another quickstart** — two good ones already exist and this repo builds directly on
-them (see [Credit](#credit)). It is a record of the things that were *not* in either recipe:
+**Start here, then read the findings.** The base stack is MiaAI-Lab's — this repo is the config
+delta on top of it plus everything that went wrong getting there and how it was fixed
+(see [Credit](#credit)). What follows was *not* in either published recipe:
 repeated node wedges (on unified memory, exhaustion does not error — it takes the whole box), a deadlock that only appears behind a default-deny
 firewall, the first speculative-decode acceptance measurements we're aware of for this model, and three
 optimisation avenues that turned out to be **dead ends** — documented as such, with numbers.
@@ -32,6 +33,58 @@ aggregate across 6 concurrent streams, code prompt, 400 `max_tokens`, `ignore_eo
 3,050 tok/s** = ~7,450-token unique prompt per run, `cached_tokens=0` asserted, n=6. **Thermals** =
 concurrency 4, 1 Hz sampling. A number without its prompt, token count and clock state is not
 comparable to anything — including these.</sub>
+
+---
+
+## Recipe
+
+**1. Base stack.** Clone [MiaAI-Lab's repo](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Dual-DGX-Sparks)
+and follow it — it builds the SM121 QSA patch onto the public SGLang image and handles fabric
+preflight, worker-first ordering and readiness waiting. Everything below is a delta on that.
+
+**2. Stage NCCL on both nodes.** Both published recipes treat host-staged NCCL as required for
+GB10 multi-node stability:
+
+```bash
+mkdir -p ~/nccl-2.30.7
+cp /usr/lib/aarch64-linux-gnu/libnccl.so.2.30.7 ~/nccl-2.30.7/
+ln -sf libnccl.so.2.30.7 ~/nccl-2.30.7/libnccl.so.2
+```
+
+**3. Apply the config delta** (table below) to the `.env`.
+
+**4. Pin the control plane to the fabric** — the single most important line if you run a
+default-deny firewall, and the one that cost us the longest debug:
+
+```bash
+-e SGLANG_HOST_IP=<this node's fabric IP>
+```
+
+**5. Evict page cache immediately before launch, and keep it bounded during the load:**
+
+```bash
+# before launch (no root needed — this is what scripts/cache-warden.py automates)
+python3 -c "
+import os,glob
+for p in glob.glob(os.path.expanduser('~/.cache/huggingface/hub/**/*.safetensors'),recursive=True):
+    rp=os.path.realpath(p)
+    if os.path.exists(rp):
+        fd=os.open(rp,os.O_RDONLY); os.posix_fadvise(fd,0,0,os.POSIX_FADV_DONTNEED); os.close(fd)"
+
+# during the load, on BOTH nodes
+python3 scripts/cache-warden.py --model-dir ~/.cache/huggingface/hub \
+    --interval 20 --stop-below-gb 25 --max-runtime 86400 --log ~/warden.jsonl
+```
+
+**6. Verify it took — at the point of effect, not in your config file:**
+
+```bash
+docker exec <container> env | grep -E 'SGLANG_HOST_IP|NCCL_IB_HCA|NCHANNELS'
+curl -s localhost:8899/get_server_info | python3 -m json.tool | grep -E 'max_total|speculative|context'
+```
+
+A setting you did not confirm arrived is a setting you did not set. Ours silently disagreed with
+the `.env` more than once.
 
 ---
 
