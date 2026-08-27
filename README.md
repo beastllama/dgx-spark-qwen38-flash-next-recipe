@@ -49,6 +49,7 @@ Two DGX Sparks. 180B params (125B backbone + 51B PLE), NVFP4, 262k context, visi
 | **6 concurrent** | **306.6** agg | 51.7/stream² |
 | Prefill | **3,050** | ~7,450-token unique prompt, `cached_tokens=0` asserted, n=6 |
 | Stress floor | 47.6 | `ignore_eos` + hard prompt + 800 tok — a deliberate FLOOR, see below |
+| Stress floor, re-measured 10 d later | 48.2 | same conditions, temp 0, after an engine restart — within noise |
 
 <sub>² Concurrency measured **before** the config was pinned — at `max_running_requests=12` and an
 unpinned KV pool of 850,816 tokens, not the 8 / 600,000 in the recipe below. Under the pinned
@@ -395,6 +396,65 @@ Tool calling was **not** harmed by thinking in our testing (correct `tool_calls`
 1.0). One recipe reports a token-0 `!!!!!` repetition loop for thinking+tools; we probed n=6 at
 temp 1.0 and saw none, on the *riskier* configuration (flashinfer sampling, radix cache on).
 **n=6 cannot prove absence of a rare probabilistic loop.** Keep it on the watch list.
+
+That watch-list item now has a confirmed sibling, below — and note *why* the n=6 probe found
+nothing: it ran at temperature 1.0, which is precisely the setting that does not loop.
+
+---
+
+## Sampling: temperature 0 is faster, and it will hang you
+
+The engine ships `sampling_defaults='model'`, so a request that sends **no** sampling parameters
+gets the checkpoint's own `generation_config`:
+
+```
+temperature 1.0   top_k 20   top_p 0.95
+```
+
+Passing `temperature: 0` overrides that. Everyone does, because greedy is what you reach for when
+you want a reproducible benchmark. On this checkpoint that is a trap on long generations.
+
+**Measured 2026-08-27.** Identical prompt (rebuild a home page from a structured brief),
+thinking off, `max_tokens 14000`:
+
+| sampling | tokens | finish | outcome |
+|---|---|---|---|
+| `temperature: 0` | 14,000 | `length` | **one CSS line emitted 507 times, never escaped** |
+| *(none sent — checkpoint default)* | 9,550 | `stop` | clean |
+| `temp 0.7 / top_p 0.8 / top_k 20` | 11,831 | `stop` | clean |
+
+The greedy run did not merely produce worse output — it never reached the end of the document, so
+the page it emitted had no `<main>`, no footer and no links. A compliance audit scored it 12/28
+against 27/29 and 28/29 for the two sampled runs.
+
+**It is length-dependent, not universal.** At 800 tokens neither config repeats a single line
+(`max repeated line = 1` in both arms). Short generations at temperature 0 are fine. The failure
+appears somewhere between there and 14k tokens, in long *structured* output — CSS and markup,
+where the token distribution is genuinely low-entropy and greedy has no way out of a basin.
+
+**And greedy is measurably faster, which is why this is a real trade rather than a bug to avoid.**
+Same 39-token prompt, 800 `max_tokens`, `ignore_eos`, `stream:false`, warmed, median of 3,
+2,431–2,489 MHz, no throttle reasons active, single stream:
+
+| sampling | tok/s | `sglang:spec_accept_length` | `sglang:spec_accept_rate` |
+|---|---|---|---|
+| `temperature: 0` | **48.2** (48.2 / 47.6 / 48.7) | 2.75 | 58.3% |
+| checkpoint default | 45.1 (45.3 / 45.1 / 42.3) | 2.525 | 50.8% |
+
+**+6.9% throughput, and the mechanism is visible in the acceptance figure.** Greedy tokens are
+more predictable, so the EAGLE drafter guesses right more often — 58.3% vs 50.8% acceptance, which
+is very nearly the whole difference. You are buying speed with the same property that causes the
+loop.
+
+**Practical guidance:**
+- **Short, deterministic outputs** (classification, extraction, structured fields, ≲2k tokens) →
+  `temperature: 0` is free speed. Take it.
+- **Long generation** (code files, whole pages, documents) → send **no sampling parameters** and
+  let the checkpoint's own config apply. The 6.9% is not worth a run that cannot finish.
+- **Benchmarks** → say which one you used. A `tok/s` figure at temperature 0 is not comparable to
+  one at checkpoint defaults, and the gap is larger than most of the effects people try to measure.
+- Do **not** set a server-side sampling default to fix this. Leave `sampling_defaults='model'` and
+  let each client choose, because the right answer genuinely differs by workload.
 
 ---
 
