@@ -310,7 +310,7 @@ property that makes self-review worth anything.
 ⚠️ **`max_tokens` ≥ 8000 for a full page.** At 2,600 the file truncated mid-CSS and produced a
 *valid-looking* file that rendered blank. No error. Only the screenshot caught it.
 
-### 5. Thinking mode: binary, and worth it — with one hard requirement
+### 5. Thinking mode: binary, helps reasoning, and fails catastrophically 30% of the time
 
 There are **no effort levels**. The engine reports
 `ReasoningToggleConfig(toggle_param='enable_thinking', default_enabled=True, effort_kwarg=None)`.
@@ -325,10 +325,37 @@ A/B on 8 reasoning problems with verifiable answers:
 
 It fixes exactly the intuition traps: bat-and-ball `$0.10 → $0.05`, "Sally's sisters" `3 → 2`.
 
-⚠️ **Wherever thinking is on, `max_tokens` must be ≥ 2000.** Thinking consumes the *same* budget as
-the answer. With a small cap the model spends the whole allowance thinking and returns **empty
-`content`** with everything in `reasoning_content` — which reads as "the model returned nothing",
-not as an error.
+⚠️ **But do not default it on for code generation.** Same task, same config, temperature 0,
+`max_tokens=14000`, n=10 each:
+
+| | runaways (empty answer, budget exhausted) | completion tokens |
+|---|---|---|
+| thinking **ON** | **3 / 10** | 1,342 – 14,000 |
+| thinking **OFF** | **0 / 10** | 222 – 287 |
+
+**30% of thinking-on requests consumed the entire 14,000-token budget and returned zero characters
+of content**, with everything in `reasoning_content` and `finish_reason: length`. Thinking off
+solved the identical task in 222–287 tokens every single time — roughly **50× cheaper and
+completely stable**.
+
+Note the token range under thinking: 1,342 to 14,000, a **10× spread at temperature 0**. Greedy
+decoding is not bit-reproducible on this stack (NVFP4 GEMM variance on sm_121 is the usual
+explanation), and thinking amplifies that divergence into a coin-flip between "fine" and
+"produces nothing at all".
+
+**Practical guidance:**
+- **Reasoning problems, short outputs** → thinking ON is a real win (6/8 → 8/8 on classic
+  intuition traps: bat-and-ball `$0.10 → $0.05`, "Sally's sisters" `3 → 2`).
+- **Code generation, long outputs** → thinking OFF. It is faster, ~50× cheaper in tokens, and does
+  not silently return nothing.
+- **If you must run thinking on unattended**, you need a guard: treat
+  `finish_reason == "length"` or empty `content` as a retryable failure, not as a model answer.
+  A harness without that guard will book 30% of its thinking-arm results as task failures and
+  conclude "thinking hurts on code" — which is not what is happening.
+
+⚠️ **Wherever thinking is on, `max_tokens` must be ≥ 2000** regardless. Thinking consumes the
+*same* budget as the answer, so a small cap guarantees the empty-content outcome rather than
+merely risking it.
 
 Tool calling was **not** harmed by thinking in our testing (correct `tool_calls` at temp 0.0, 0.7 and
 1.0). One recipe reports a token-0 `!!!!!` repetition loop for thinking+tools; we probed n=6 at
