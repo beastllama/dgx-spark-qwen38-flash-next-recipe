@@ -401,7 +401,7 @@ nothing: it ran at temperature 1.0, which is precisely the setting that does not
 
 ---
 
-## Sampling: a repetition loop at temperature 0 — cause NOT established
+## Sampling: a 1-in-5 repetition loop at temperature 0 — cause NOT established
 
 The engine ships `sampling_defaults='model'`, so a request that sends **no** sampling parameters
 gets the checkpoint's own `generation_config`:
@@ -410,7 +410,8 @@ gets the checkpoint's own `generation_config`:
 temperature 1.0   top_k 20   top_p 0.95
 ```
 
-Passing `temperature: 0` overrides that. **On this stack, a long greedy generation looped.**
+Passing `temperature: 0` overrides that. **On this stack, long greedy builds loop
+INTERMITTENTLY — measured at 1 of 5 runs.**
 
 **What was measured (2026-08-27).** Identical prompt — rebuild a home page from a structured
 brief — thinking off, `max_tokens 14000`, **one run per arm**:
@@ -424,6 +425,26 @@ brief — thinking off, `max_tokens 14000`, **one run per arm**:
 The greedy run never reached the end of the document, so the page had no `<main>`, no footer and
 no links — which is why the compliance score collapses. At 800 tokens **neither** config repeats
 a line, so whatever this is, it is length-dependent.
+
+**It is rare, and our first write-up of it was wrong.** The identical greedy build was re-run four
+more times on the same prompt:
+
+```
+run 1  10,785 tok  finish=stop    max repeated content line 3   clean
+run 2  11,006 tok  finish=stop    max repeated content line 3   clean
+run 3  12,252 tok  finish=stop    max repeated content line 4   clean
+run 4  14,000 tok  finish=length  max repeated content line 1   clean (long, not looping)
+```
+
+**0 of 4.** Pooled with the original, the observed rate is **1 in 5** — not something greedy does,
+something greedy sometimes does. Greedy decoding is **not bit-reproducible on this stack** (NVFP4
+GEMM variance on sm_121 — the same effect behind the 10× token spread documented in the thinking
+section above), so `temperature: 0` names a *distribution*, not one trajectory. A small slice of
+that distribution lands in a basin greedy cannot leave. A sampled decoder can land in the same
+basin and still escape by chance — that asymmetry, not the loop itself, is the finding.
+
+The two sampled arms are **one run each**. n=1 bounds nothing; treat their rate as unmeasured,
+merely lower.
 
 ### Why we are NOT claiming "temperature 0 causes this"
 
@@ -468,12 +489,20 @@ and a named prompt.
 
 **Practical guidance, as far as it is actually supported:**
 - **Long generation on a flashinfer-sampling stack** → send no sampling parameters, or cap
-  temperature at ≤0.7 per tonyd2wild. Both completed cleanly here; greedy did not.
-- **Do not set a server-side sampling default to paper over this.** Leave
-  `sampling_defaults='model'`. If the sampling backend is the real cause, a temperature clamp
-  hides the bug rather than fixing it.
-- **Benchmarks** → always say which sampling config produced the number. Whatever the true size of
-  the effect, it is not zero and it is not comparable across configs.
+  temperature at ≤0.7 per tonyd2wild. Both completed cleanly here — *one run each*, so this is a
+  completion, not a rate. The reason to prefer them is the escape asymmetry above, not a measured
+  difference in loop frequency.
+- **A 1-in-5 chance of losing the whole document is worth engineering around** even though it is
+  rare. If you run greedy on long output, treat `finish_reason == "length"` plus a high
+  repeated-line count as a retryable failure.
+- **On the server-side default there is a real trade, and we have not resolved it.** We leave
+  `sampling_defaults='model'`, which serves temp 1.0 to any client that sends nothing — and temp
+  1.0 is precisely where tonyd2wild reports his residual edge, with an explicit recommendation to
+  cap agent temperature at ≤0.7. Keeping `model` preserves the diagnostic signal and honours the
+  checkpoint's own config; it also defaults silent clients into the one regime the cited source
+  calls risky. Pick deliberately rather than inheriting it, as we did.
+- **Benchmarks** → always say which sampling config produced the number. The direction is
+  plausible; the size, and whether it exists at all, is unmeasured.
 
 ---
 
