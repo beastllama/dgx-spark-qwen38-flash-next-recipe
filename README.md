@@ -21,7 +21,7 @@ Everything here was measured on real hardware. Where a number is contested or un
 |---|---|
 | Serving | ✅ TP=2 across 2 nodes, 262,144 context |
 | Vision | ✅ verified end-to-end (see below) |
-| Spec decode | ✅ NEXTN 3/1/4 (`num_steps`/`eagle_topk`/`num_draft_tokens`) — **the architectural maximum, not a default** |
+| Spec decode | ✅ NEXTN 3/1/4 (`num_steps`/`eagle_topk`/`num_draft_tokens`) — note the engine self-reports `speculative_algorithm: EAGLE` — **the architectural maximum, not a default** |
 | Decode | **~63 tok/s** single-stream on real generation |
 | Concurrency | **306 tok/s** aggregate at 6 streams |
 | Prefill | 3,050 tok/s (cache defeated) |
@@ -44,11 +44,16 @@ Two DGX Sparks. 180B params (125B backbone + 51B PLE), NVFP4, 262k context, visi
 |---|---|---|
 | **Single stream, real work** | **~63** | 10.7k-token HTML page, natural stop, 2522 MHz |
 | Single stream, 400 tok | 63.7 | code prompt, `ignore_eos` |
-| 2 concurrent | **104.9** agg | 52.8/stream |
-| 4 concurrent | **178.7** agg | 45.2/stream |
-| **6 concurrent** | **306.6** agg | 51.7/stream — still climbing |
+| 2 concurrent | **104.9** agg | 52.8/stream² |
+| 4 concurrent | **178.7** agg | 45.2/stream² |
+| **6 concurrent** | **306.6** agg | 51.7/stream² |
 | Prefill | **3,050** | ~7,450-token unique prompt, `cached_tokens=0` asserted, n=6 |
 | Stress floor | 47.6 | `ignore_eos` + hard prompt + 800 tok — a deliberate FLOOR, see below |
+
+<sub>² Concurrency measured **before** the config was pinned — at `max_running_requests=12` and an
+unpinned KV pool of 850,816 tokens, not the 8 / 600,000 in the recipe below. Under the pinned
+config 8 is the cap, so 6 streams is near it rather than "still climbing". Re-measure before
+quoting these against the shipped config.</sub>
 
 **Power and heat, at concurrency 4:** **52 °C, 35.5 W** peak per node; 42 °C / 10.4 W idle. That is
 roughly **half the draw** of a comparably-sized dense-ish MoE we previously ran on the same boxes
@@ -300,7 +305,9 @@ LMSYS also names the mechanism behind the ceiling: **IndexShare MTP** reuses QSA
 draft steps, which is precisely why the pending index-key ring holds a single group.
 
 ⚠️ **Acceptance swings ~40 pp on prompt alone.** Measured on the same engine within one hour:
-`3.5–3.7` on one code prompt, `2.475` on a chat+code mix. All arithmetically self-consistent — they
+accept **length** `3.5–3.7` on one code prompt vs `2.475` on a chat+code mix — i.e. accept **rate**
+~0.84–0.90 vs ~0.49, a ~40 **percentage-point** swing (length and rate are different units;
+rate = (length − 1) / draft_steps). All arithmetically self-consistent — they
 measure different prompt mixes. **Never quote an acceptance number without naming the prompt set.**
 
 **Is there a way past the ceiling?** Not today. As of 2026-08-27 no DFlash / DSpark / EAGLE3
