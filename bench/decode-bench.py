@@ -14,7 +14,7 @@ natural stopping point into degenerate text. Real generation on the same stack m
 Engine metric namespaces differ (`vllm:*` vs `sglang:*`) and the names are NOT the same; both are
 parsed BY NAME. If neither matches, in-flight reads as UNVERIFIED -- never as "idle".
 
-Env: BENCH_HOST BENCH_MODEL BENCH_NS BENCH_RUNS BENCH_MAX_TOK BENCH_LABEL BENCH_CLOCK_CMD
+Env: BENCH_HOST BENCH_MODEL BENCH_NS BENCH_RUNS BENCH_MAX_TOK BENCH_LABEL BENCH_CLOCK_CMD BENCH_DEPTH
 """
 import json, os, re, subprocess, sys, threading, time, urllib.request
 
@@ -36,6 +36,37 @@ PROMPTS = {
     "chat": "Explain how consensus works in a distributed database, with examples.",
     "code": "Write a Python LRU cache with TTL expiry, thread-safe, with tests. Explain the design.",
 }
+
+# ── context depth ────────────────────────────────────────────────────────────
+# BENCH_DEPTH pads the prompt to roughly this many tokens so decode is measured
+# at a chosen context length. Motivation, observed on production traffic
+# 2026-08-27: at ~170k context `sglang:spec_accept_length` read 1.00 -- the
+# drafter contributing NOTHING -- against 2.75 on a 39-token prompt. If that
+# holds, the ~3x speculative speedup this stack advertises is a SHORT-CONTEXT
+# number. That needs a controlled sweep, which needs this knob.
+#
+# The filler is UNIQUE per run (a counter is embedded) so the prefix cache cannot
+# serve it. A cached prefill would make deep runs decode against a warm cache and
+# report a depth the engine never actually processed -- and `cached_tokens` is
+# asserted below rather than assumed.
+DEPTH = int(os.environ.get("BENCH_DEPTH", "0"))
+_depth_seq = [0]
+
+
+def pad(prompt):
+    """Return (prompt, expected_prefill_tokens). No padding when DEPTH is 0."""
+    if DEPTH <= 0:
+        return prompt, 0
+    _depth_seq[0] += 1
+    # ~4 chars/token is close enough; the ACTUAL prompt_tokens is read back from
+    # the response and reported, so the label never depends on this estimate.
+    words = []
+    seed = f"run{_depth_seq[0]}x{int(time.time())}"
+    for i in range(DEPTH):
+        words.append(f"{seed}-{i:06d}")
+    filler = " ".join(words)[: DEPTH * 4]
+    return (f"Reference log (ignore it; answer only the question at the end):\n"
+            f"{filler}\n\nQuestion: {prompt}"), DEPTH
 
 def inflight():
     try:
@@ -75,6 +106,7 @@ def contended(samples):
     return ""
 
 def one(prompt):
+    prompt, _ = pad(prompt)
     body = json.dumps({"model": MODEL, "messages": [{"role": "user", "content": prompt}],
                        "max_tokens": MAX_TOK, "min_tokens": MAX_TOK, "ignore_eos": True,
                        "temperature": 0, "stream": False}).encode()
@@ -88,10 +120,26 @@ def one(prompt):
     finally:
         stop.set(); th.join(timeout=5)
     dt = time.time() - t0
-    tok = d["usage"]["completion_tokens"]
+    u = d["usage"]
+    tok = u["completion_tokens"]
     if tok < MAX_TOK * 0.9:
         return None, f"only {tok}/{MAX_TOK} tok generated"
-    return (dt, tok), contended(s)
+    # A deep run served from the prefix cache did not measure that depth. Assert
+    # it rather than trusting the unique filler to have worked.
+    cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+    if DEPTH and cached > u["prompt_tokens"] * 0.2:
+        return None, f"prefix cache served {cached}/{u['prompt_tokens']} prompt tok — depth not real"
+    return (dt, tok, u["prompt_tokens"], cached, accept_length()), contended(s)
+
+
+def accept_length():
+    """sglang:spec_accept_length, BY NAME. None (never 0.0) when absent."""
+    try:
+        b = urllib.request.urlopen(HOST + "/metrics", timeout=8).read().decode()
+        m = re.search(r"^sglang:spec_accept_length\{[^}]*\}\s+([0-9.eE+-]+)", b, re.M)
+        return float(m.group(1)) if m else None
+    except Exception:
+        return None
 
 def main():
     # Clock state is REQUIRED context for a throughput number -- prompt, token count and clock
@@ -120,14 +168,27 @@ def main():
             r, why = one(p)
             if why or r is None:
                 print(f"    [{name}] attempt {att}: DISCARDED — {why}", flush=True); continue
-            dt, tok = r; res.append(tok / dt)
-            print(f"    [{name}] clean {len(res)}/{RUNS}: {tok/dt:6.2f} tok/s  ({dt:.2f}s)", flush=True)
+            dt, tok, ptok, cached, al = r
+            res.append((tok / dt, ptok, al))
+            print(f"    [{name}] clean {len(res)}/{RUNS}: {tok/dt:6.2f} tok/s  ({dt:.2f}s)  "
+                  f"prompt={ptok:,} cached={cached}  accept_len={al if al is None else round(al,2)}",
+                  flush=True)
         if res:
-            res.sort(); out[name] = res[len(res)//2]
+            res.sort(key=lambda x: x[0])
+            mid = res[len(res)//2]
+            als = [x[2] for x in res if x[2] is not None]
+            out[name] = {"tok_s": mid[0], "prompt_tokens": mid[1],
+                         "accept_length_median": (sorted(als)[len(als)//2] if als else None)}
     print()
-    for k, v in out.items(): print(f"  {k:5} median {v:.2f} tok/s   (n clean runs above)")
-    if out: print(f"  MEAN of medians: {sum(out.values())/len(out):.2f} tok/s")
-    print(json.dumps({"label": LABEL, "clock": clk, "max_tok": MAX_TOK, "medians": out}))
+    for k, v in out.items():
+        al = v["accept_length_median"]
+        print(f"  {k:5} median {v['tok_s']:.2f} tok/s   prompt={v['prompt_tokens']:,} tok   "
+              f"accept_len={'UNVERIFIED' if al is None else round(al,2)}")
+    if out:
+        print(f"  MEAN of medians: {sum(v['tok_s'] for v in out.values())/len(out):.2f} tok/s")
+    print(json.dumps({"label": LABEL, "clock": clk, "max_tok": MAX_TOK,
+                      "depth_requested": DEPTH, "results": out}))
     return 0
 
-sys.exit(main())
+if __name__ == "__main__":
+    sys.exit(main())
